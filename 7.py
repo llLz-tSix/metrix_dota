@@ -792,6 +792,7 @@ PRO_DAYS = 90                  # учитываем только про-матч
 MIN_GAMES_THRESHOLD = 3        # в про-играх выборка маленькая, порог низкий
 SHRINK_K = 12                  # "вес" априорного винрейта при сглаживании
 META_SHRINK_K = 10
+MATCHUP_WR_MIN_GAMES = 10  # показываем процент только при достаточной выборке
 MATRIX_TTL = 6 * 3600
 ITEMS_TTL = 12 * 3600
 DOTABUFF_TTL = 12 * 3600
@@ -1092,8 +1093,8 @@ def _matrix_dict(bundle: dict) -> dict:
 
 
 def _enemy_sql(client: ApiClient, enemy_id: int) -> dict:
-    """Запасной путь из старого 9.py: лёгкий запрос на одного врага."""
-    key = f"pro_enemy_v3_{enemy_id}"
+    """Про-матчапы выбранного врага; при сбое использует сохранённый снимок."""
+    key = f"pro_enemy_v3_{int(enemy_id)}"
     cached, age = disk_read(key)
     if not st.session_state.get("_force_refresh_data") and cached is not None and age < MATRIX_TTL:
         return {int(k): tuple(v) for k, v in cached.items()}
@@ -1106,13 +1107,21 @@ JOIN player_matches c ON c.match_id = m.match_id
  AND (c.player_slot < 128) <> (e.player_slot < 128)
 WHERE m.leagueid > 0 AND m.start_time > {_since()}
 GROUP BY c.hero_id"""
-    out = {}
-    for r in _run_sql(client, sql):
-        games, wins = _i(r["games"]), _i(r["wins"])
-        out[_i(r["hero_id"])] = (games, games - wins)
-    disk_write(key, {str(k): list(v) for k, v in out.items()})
-    return out
-
+    try:
+        out = {}
+        for r in _run_sql(client, sql):
+            games, wins = _i(r["games"]), _i(r["wins"])
+            out[_i(r["hero_id"])] = (games, games - wins)
+        if out:
+            disk_write(key, {str(k): list(v) for k, v in out.items()})
+            return out
+        if cached is not None:
+            return {int(k): tuple(v) for k, v in cached.items()}
+        return out
+    except Exception:
+        if cached is not None:
+            return {int(k): tuple(v) for k, v in cached.items()}
+        raise
 
 def _enemy_combined_matchups(enemy_id: int) -> dict:
     """За один SQL-запрос получает про- и high-MMR матчапы выбранного врага."""
@@ -1176,18 +1185,26 @@ GROUP BY c.hero_id"""
 
 
 def _enemy_public(client: ApiClient, enemy_id: int) -> dict:
-    """Аварийный путь: /heroes/{id}/matchups (не ограничен периодом)."""
-    key = f"hero_matchups_v3_{enemy_id}"
+    """All-time OpenDota matchup snapshot, retained as offline fallback."""
+    key = f"hero_matchups_v3_{int(enemy_id)}"
     cached, age = disk_read(key)
-    # Keep this broad fallback cached even on a manual refresh: it is only a prior,
-    # while the recent pro/high-MMR sources are refreshed independently.
     if cached is not None and age < MATRIX_TTL:
         return {int(k): tuple(v) for k, v in cached.items()}
-    rows = client.get_json(f"{OPENDOTA_HEROES_URL}/{int(enemy_id)}/matchups")
-    out = {_i(r["hero_id"]): (_i(r["games_played"]), _i(r["wins"])) for r in rows}
-    disk_write(key, {str(k): list(v) for k, v in out.items()})
-    return out
-
+    try:
+        rows = client.get_json(f"{OPENDOTA_HEROES_URL}/{int(enemy_id)}/matchups")
+        out = {_i(r["hero_id"]): (_i(r["games_played"]), _i(r["wins"])) for r in rows}
+        if out:
+            disk_write(key, {str(k): list(v) for k, v in out.items()})
+            return out
+        # A transient empty response must not erase a previously useful snapshot.
+        if cached is not None:
+            return {int(k): tuple(v) for k, v in cached.items()}
+        return out
+    except Exception:
+        # Keep last successful all-time matchup data indefinitely when upstream is down.
+        if cached is not None:
+            return {int(k): tuple(v) for k, v in cached.items()}
+        raise
 
 def fetch_matchups(enemy_ids) -> dict:
     """{enemy_id: {hero_id: (games, enemy_wins)}} — про-матчи за PRO_DAYS дней."""
@@ -1254,12 +1271,27 @@ def fetch_public_matchups(enemy_ids) -> dict:
         return cached_request[1]
     client = get_client()
     out = {}
-    # _enemy_public has a six-hour disk cache; parallel fetches avoid serial wait on cold cache.
+    # Keep stale all-time snapshots as a disk-backed reserve if refresh fails.
+    stale_before = set()
+    for enemy_id in ids:
+        _snapshot, _age = disk_read(f"hero_matchups_v3_{enemy_id}")
+        if _snapshot and _age is not None and _age >= MATRIX_TTL:
+            stale_before.add(enemy_id)
     for enemy_id, data, err in _parallel(lambda e: _enemy_public(client, e), ids, workers=5):
         if err:
             _note_error(f"heroes/{enemy_id}/matchups -> {err}")
         else:
             out[enemy_id] = data
+    stale_used = []
+    for enemy_id in stale_before:
+        _snapshot, _age = disk_read(f"hero_matchups_v3_{enemy_id}")
+        if out.get(enemy_id) and _age is not None and _age >= MATRIX_TTL:
+            stale_used.append(enemy_id)
+    data_status = st.session_state.setdefault("data_status", {})
+    if stale_used:
+        data_status["matchup_backup"] = f"резерв: сохранённые OpenDota матчапы для {len(stale_used)} враг(ов)"
+    elif not any(out.values()):
+        data_status["matchup_backup"] = "нет матчап-статистики; рекомендации опираются на доступную мету и билды"
     st.session_state["_request_public_matchups"] = (ids, out)
     return out
 
@@ -1334,7 +1366,7 @@ def prefetch_matchups(enemy_ids) -> None:
 
 
 def fetch_meta_stats() -> dict:
-    """Текущая про-мета: {hero_id: {"picks", "winrate"}} за PRO_DAYS дней."""
+    """Про-мета за период; при недоступности API использует последний снимок."""
     client = get_client()
     bundle, _info = get_pro_data(client)
     result = {}
@@ -1345,21 +1377,24 @@ def fetch_meta_stats() -> dict:
                 "winrate": (wins + META_SHRINK_K * 0.5) / (picks + META_SHRINK_K) * 100 if picks else None,
             }
         return result
-    try:
-        cached, age = disk_read("herostats_v3")
-        if st.session_state.get("_force_refresh_data") or cached is None or age >= MATRIX_TTL:
-            cached = client.get_json(OPENDOTA_HEROSTATS_URL, timeout=20)
-            disk_write("herostats_v3", cached)
-        for h in cached:
-            picks, wins = _i(h.get("pro_pick")), _i(h.get("pro_win"))
-            result[_i(h.get("id"))] = {
-                "picks": picks,
-                "winrate": (wins + META_SHRINK_K * 0.5) / (picks + META_SHRINK_K) * 100 if picks else None,
-            }
-    except Exception as exc:  # noqa: BLE001
-        _note_error(f"heroStats -> {type(exc).__name__}: {exc}")
-    return result
 
+    cached, age = disk_read("herostats_v3")
+    if st.session_state.get("_force_refresh_data") or cached is None or age >= MATRIX_TTL:
+        try:
+            fresh = client.get_json(OPENDOTA_HEROSTATS_URL, timeout=20)
+            if fresh:
+                cached = fresh
+                disk_write("herostats_v3", cached)
+        except Exception as exc:  # noqa: BLE001
+            if cached is None:
+                _note_error(f"heroStats -> {type(exc).__name__}: {exc}")
+    for h in cached or []:
+        picks, wins = _i(h.get("pro_pick")), _i(h.get("pro_win"))
+        result[_i(h.get("id"))] = {
+            "picks": picks,
+            "winrate": (wins + META_SHRINK_K * 0.5) / (picks + META_SHRINK_K) * 100 if picks else None,
+        }
+    return result
 
 # ---------- Dotabuff (дополнительный источник) ----------
 
@@ -2094,6 +2129,11 @@ def _item_stage_card(title: str, entries: list[tuple[str, str]]) -> str:
             f'<div class="dm-item-grid">{"".join(cards)}</div></section>')
 
 
+def _matchup_rate_label(source: str, rate: float, games: int) -> str:
+    if games < MATCHUP_WR_MIN_GAMES:
+        return f"{source}: мало данных ({games} матч.)"
+    return f"{source} {rate:.0f}% · {games} игр"
+
 def _matchup_visual(candidate_id: int, enemy_ids: list[int], pro: dict, ranked: dict, dotabuff: dict, public: dict | None = None) -> str:
     public = public or {}
     cards = []
@@ -2122,10 +2162,15 @@ def _matchup_visual(candidate_id: int, enemy_ids: list[int], pro: dict, ranked: 
             observed = sum(value * confidence * base for value, confidence, base in sources) / observed_weight
             rate = 50 + (observed - 50) * min(1.0, observed_weight / weight)
             sample = max(games, ranked_games, public_games, db[0] if db else 0)
-            rate_text = f"{rate:.0f}%"
-            bar = f'<i style="width:{rate:.1f}%"></i>'
             source_text = "вся история OpenDota" if public_games and public_games >= max(games, ranked_games, db[0] if db else 0) else "свежие выборки"
-            sample_text = f"{sample} игр · {source_text}"
+            if sample < MATCHUP_WR_MIN_GAMES:
+                rate_text = "—"
+                bar = '<i class="dm-match-low" style="width:50%"></i>'
+                sample_text = f"мало данных · {sample} матч. · {source_text}"
+            else:
+                rate_text = f"{rate:.0f}%"
+                bar = f'<i style="width:{rate:.1f}%"></i>'
+                sample_text = f"{sample} игр · {source_text}"
         else:
             rate_text, bar, sample_text = "—", "", "нет данных"
         cards.append(
@@ -2289,6 +2334,7 @@ li[role="option"]:hover,li[role="option"][aria-selected="true"]{background:#262a
 .dm-match-track{position:relative;height:5px;margin:8px 0 4px;overflow:hidden;border-radius:99px;background:#2b2e28}
 .dm-match-track:after{content:"";position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(239,232,209,.45)}
 .dm-match-track i{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,#80624e,#cf8a68)}
+.dm-match-track i.dm-match-low{background:#45463f;opacity:.7}
 .dm-match-card>small{font-size:10px;color:var(--dm-muted)}
 .dm-match-head .dm-hero-icon{width:30px;height:30px}
 .dm-item-stage{margin:14px 0 18px}
@@ -2428,6 +2474,8 @@ def _status_text() -> str:
         parts.append(f"про-матчи OpenDota за {PRO_DAYS} дн. (запросы по каждому выбранному врагу, кэш на диске)")
     elif src == "public-fallback":
         parts.append("про-данные недоступны, использованы публичные матчапы OpenDota (вне периода)")
+    if s.get("matchup_backup"):
+        parts.append(s["matchup_backup"])
     if s.get("ranked_matchups", {}).get("error") is None and s.get("ranked_matchups"):
         parts.append("матчапы Divine/Immortal за 30 дней")
     d2pt = s.get("d2pt")
@@ -2489,14 +2537,14 @@ if st.session_state.analyzed and st.session_state.enemy_ids:
                         parts = []
                         if games:
                             adjusted_wr = (games - enemy_wins + SHRINK_K * 0.5) / (games + SHRINK_K) * 100
-                            parts.append(f"OpenDota {adjusted_wr:.0f}% · {games} игр")
+                            parts.append(_matchup_rate_label("OpenDota", adjusted_wr, games))
                         high_games, high_enemy_wins = _high_mmr_matchups.get(enemy_id, {}).get(pick["id"], (0, 0))
                         if high_games:
                             high_adjusted = (high_games - high_enemy_wins + 10) / (high_games + 20) * 100
-                            parts.append(f"Divine/Immortal {high_adjusted:.0f}% · {high_games} игр")
+                            parts.append(_matchup_rate_label("Divine/Immortal", high_adjusted, high_games))
                         db_entry = _db.get(enemy_id, {}).get(pick["id"])
                         if db_entry:
-                            parts.append(f"Dotabuff {db_entry[1]:.0f}% · {db_entry[0]} игр")
+                            parts.append(_matchup_rate_label("Dotabuff", db_entry[1], db_entry[0]))
                         st.caption(f"{HEROES[enemy_id]}: " + (" · ".join(parts) or "нет статистики"))
 
         if rest:
@@ -2609,6 +2657,12 @@ if st.session_state.analyzed and st.session_state.enemy_ids:
             st.write("Специфических предметных противодействий не требуется.")
 
     st.success("Данные успешно сформированы.")
+
+
+
+
+
+
 
 
 
